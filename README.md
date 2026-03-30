@@ -14,6 +14,9 @@ This is useful when the agent itself runs in Linux or Docker, but the actual iOS
   - `PREPARING_WORKTREE:...`
   - `WORKTREE_PATH:...`
   - `BUILD_CWD:...`
+  - `BUILD_STARTED`
+  - `XCODEBUILD_PID:...`
+  - `BUILD_HEARTBEAT:elapsedMs=...` during long silent compile phases
   - compiler / build errors
   - `BUILD SUCCEEDED` or `BUILD FAILED`
 - Ends with a machine-readable JSON block after `__RESULT__`.
@@ -82,6 +85,15 @@ Useful summary fields:
 
 For failures, the JSON contains extracted error lines and falls back to a useful log tail when explicit error lines are missing.
 
+Useful streamed markers before `__RESULT__`:
+
+- `PREPARING_WORKTREE:<branch>`
+- `WORKTREE_PATH:<path>`
+- `BUILD_CWD:<path>`
+- `BUILD_STARTED`
+- `XCODEBUILD_PID:<pid>`
+- `BUILD_HEARTBEAT:elapsedMs=<ms>`
+
 ## Example
 
 From a container talking to the macOS host:
@@ -140,6 +152,8 @@ Request JSON:
 
 Behavior:
 - The service fetches remotes, creates a temporary git worktree for the branch, runs xcodebuild there, streams notable build lines, and removes the worktree afterward.
+- It emits `BUILD_STARTED` when the `xcodebuild` process has been spawned successfully.
+- It emits `BUILD_HEARTBEAT` every ~30 seconds during silent compile phases so clients can distinguish “still running” from “hung”.
 - The response is plain text and ends with:
   __RESULT__
   { ...json summary... }

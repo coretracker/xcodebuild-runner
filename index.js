@@ -7,6 +7,8 @@ import path from "path";
 const DEFAULT_PORT = 48173;
 const parsedPort = Number.parseInt(process.env.PORT ?? "", 10);
 const PORT = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : DEFAULT_PORT;
+const HEARTBEAT_IDLE_MS = 30_000;
+const HEARTBEAT_TICK_MS = 5_000;
 const IMPORTANT_FAILURE_MARKERS = [
   "BUILD FAILED",
   "TEST FAILED",
@@ -233,6 +235,9 @@ const server = http.createServer((req, res) => {
     const streamed = new Set();
     let finished = false;
     const startedAt = Date.now();
+    let lastProcessOutputAt = startedAt;
+    let lastHeartbeatAt = 0;
+    let heartbeatTimer = null;
 
     const streamLine = (line) => {
       const trimmed = line.trim();
@@ -247,6 +252,11 @@ const server = http.createServer((req, res) => {
     const finalize = async (summary, statusLine) => {
       if (finished) return;
       finished = true;
+
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
 
       stdoutStreamer.flush();
       stderrStreamer.flush();
@@ -304,15 +314,35 @@ const server = http.createServer((req, res) => {
         },
       });
 
+      res.write("BUILD_STARTED\n");
+      if (child.pid) {
+        res.write(`XCODEBUILD_PID:${child.pid}\n`);
+      }
+
+      heartbeatTimer = setInterval(() => {
+        if (finished) return;
+        const now = Date.now();
+        if (now - lastProcessOutputAt < HEARTBEAT_IDLE_MS) {
+          return;
+        }
+        if (now - lastHeartbeatAt < HEARTBEAT_IDLE_MS) {
+          return;
+        }
+        lastHeartbeatAt = now;
+        res.write(`BUILD_HEARTBEAT:elapsedMs=${now - startedAt}\n`);
+      }, HEARTBEAT_TICK_MS);
+
       child.stdout.on("data", (chunk) => {
         const text = chunk.toString("utf8");
         combined += text;
+        lastProcessOutputAt = Date.now();
         stdoutStreamer.push(text);
       });
 
       child.stderr.on("data", (chunk) => {
         const text = chunk.toString("utf8");
         combined += text;
+        lastProcessOutputAt = Date.now();
         stderrStreamer.push(text);
       });
 
