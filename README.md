@@ -32,6 +32,7 @@ This is useful when the agent itself runs in Linux or Docker, but the actual iOS
 - the target repository already cloned on disk
 - the requested branch available locally or fetchable from the repo remote
 - default port `48173` unless overridden with `PORT`
+- logs are written to `./logs` by default unless overridden with `LOG_DIR`
 
 ## API
 
@@ -93,6 +94,32 @@ Useful streamed markers before `__RESULT__`:
 - `BUILD_STARTED`
 - `XCODEBUILD_PID:<pid>`
 - `BUILD_HEARTBEAT:elapsedMs=<ms>`
+
+## Logging
+
+The runner now logs locally in two places:
+
+- Terminal/stdout: request lifecycle, worktree setup, build start, heartbeats, important build errors, and final status.
+- Files under `logs/` by default:
+  - `logs/xcodebuild-runner.log`: server-level log stream
+  - `logs/build-<timestamp>-<branch>-<requestId>.log`: full output for a single build, including raw `xcodebuild` output
+
+You can override the directory with `LOG_DIR=/absolute/path/to/logs`.
+
+Useful watch commands:
+
+```bash
+tail -f logs/xcodebuild-runner.log
+```
+
+```bash
+tail -f logs/build-*.log
+```
+
+When a build finishes, the final JSON summary now includes:
+
+- `requestId`
+- `buildLogPath`
 
 ## Example
 

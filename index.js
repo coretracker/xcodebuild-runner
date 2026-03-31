@@ -1,12 +1,17 @@
 import http from "http";
+import { randomUUID } from "crypto";
 import { spawn } from "child_process";
+import { createWriteStream, mkdirSync } from "fs";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
 
 const DEFAULT_PORT = 48173;
+const DEFAULT_LOG_DIR = path.resolve(process.cwd(), "logs");
 const parsedPort = Number.parseInt(process.env.PORT ?? "", 10);
 const PORT = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : DEFAULT_PORT;
+const LOG_DIR = process.env.LOG_DIR ? path.resolve(process.env.LOG_DIR) : DEFAULT_LOG_DIR;
+const SERVER_LOG_PATH = path.join(LOG_DIR, "xcodebuild-runner.log");
 const HEARTBEAT_IDLE_MS = 30_000;
 const HEARTBEAT_TICK_MS = 5_000;
 const IMPORTANT_FAILURE_MARKERS = [
@@ -18,6 +23,78 @@ const IMPORTANT_FAILURE_MARKERS = [
   "Build operation failed without specifying any errors.",
   "Individual build tasks may have failed for unknown reasons."
 ];
+
+mkdirSync(LOG_DIR, { recursive: true });
+
+const serverLogStream = createWriteStream(SERVER_LOG_PATH, { flags: "a" });
+serverLogStream.on("error", (err) => {
+  process.stderr.write(`${new Date().toISOString()} ERROR server_log_stream_failed error=${JSON.stringify(err.message)} path=${JSON.stringify(SERVER_LOG_PATH)}\n`);
+});
+
+function serializeMetaValue(value) {
+  if (value instanceof Error) return JSON.stringify(value.message);
+  if (typeof value === "string") return JSON.stringify(value);
+  return JSON.stringify(value);
+}
+
+function formatMeta(meta = {}) {
+  return Object.entries(meta)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${serializeMetaValue(value)}`)
+    .join(" ");
+}
+
+function writeLogLine(target, line) {
+  try {
+    target.write(line);
+  } catch (err) {
+    process.stderr.write(`${new Date().toISOString()} ERROR log_write_failed target=${target === serverLogStream ? "\"server\"" : "\"stdio\""} error=${JSON.stringify(err.message)}\n`);
+  }
+}
+
+function log(level, message, meta = {}) {
+  const normalizedLevel = level.toUpperCase();
+  const metaText = formatMeta(meta);
+  const line = `${new Date().toISOString()} ${normalizedLevel} ${message}${metaText ? ` ${metaText}` : ""}\n`;
+  writeLogLine(normalizedLevel === "ERROR" ? process.stderr : process.stdout, line);
+  writeLogLine(serverLogStream, line);
+}
+
+function sanitizeForFilename(value) {
+  return value
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "build";
+}
+
+function createBuildLogStream(requestId, branch, startedAt) {
+  const safeBranch = sanitizeForFilename(branch);
+  const safeTimestamp = new Date(startedAt).toISOString().replace(/[:.]/g, "-");
+  const logPath = path.join(LOG_DIR, `build-${safeTimestamp}-${safeBranch}-${requestId}.log`);
+  const stream = createWriteStream(logPath, { flags: "a" });
+  stream.on("error", (err) => {
+    log("ERROR", "build_log_stream_failed", { requestId, buildLogPath: logPath, error: err.message });
+  });
+  return { logPath, stream };
+}
+
+function writeRequestLog(stream, text) {
+  if (!stream || !text) return;
+  try {
+    stream.write(text);
+  } catch {}
+}
+
+function closeRequestLog(stream) {
+  if (!stream) return;
+  try {
+    stream.end();
+  } catch {}
+}
+
+function buildRequestId() {
+  return `${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+}
 
 function run(cmd, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -159,7 +236,16 @@ async function removeWorktree(repoPath, worktreePath) {
 }
 
 const server = http.createServer((req, res) => {
+  const requestId = buildRequestId();
+  const remoteAddress = req.socket.remoteAddress ?? null;
+
   if (req.method !== "POST" || req.url !== "/xcodebuild") {
+    log("WARN", "http_not_found", {
+      requestId,
+      method: req.method,
+      url: req.url,
+      remoteAddress,
+    });
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Not found");
     return;
@@ -171,10 +257,19 @@ const server = http.createServer((req, res) => {
   });
 
   req.on("end", async () => {
+    log("INFO", "http_request_received", {
+      requestId,
+      method: req.method,
+      url: req.url,
+      remoteAddress,
+      bodyBytes: Buffer.byteLength(body),
+    });
+
     let payload;
     try {
       payload = JSON.parse(body || "{}");
     } catch {
+      log("WARN", "invalid_json", { requestId, remoteAddress });
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "Invalid JSON" }));
       return;
@@ -188,40 +283,49 @@ const server = http.createServer((req, res) => {
     } = payload;
 
     if (!repoPath || typeof repoPath !== "string") {
+      log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`repoPath` is required" });
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "`repoPath` is required" }));
       return;
     }
 
     if (!path.isAbsolute(repoPath)) {
+      log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`repoPath` must be an absolute path" });
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "`repoPath` must be an absolute path" }));
       return;
     }
 
     if (!branch || typeof branch !== "string") {
+      log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`branch` is required" });
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "`branch` is required" }));
       return;
     }
 
     if (!Array.isArray(args)) {
+      log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`args` must be an array" });
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "`args` must be an array" }));
       return;
     }
 
     if (!args.every((arg) => typeof arg === "string")) {
+      log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`args` must be an array of strings" });
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "`args` must be an array of strings" }));
       return;
     }
 
     if (typeof subdir !== "string") {
+      log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`subdir` must be a string" });
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "`subdir` must be a string" }));
       return;
     }
+
+    const startedAt = Date.now();
+    const { logPath: buildLogPath, stream: requestLogStream } = createBuildLogStream(requestId, branch, startedAt);
 
     res.writeHead(200, {
       "Content-Type": "text/plain; charset=utf-8",
@@ -234,16 +338,40 @@ const server = http.createServer((req, res) => {
     let buildCwd = "";
     const streamed = new Set();
     let finished = false;
-    const startedAt = Date.now();
     let lastProcessOutputAt = startedAt;
     let lastHeartbeatAt = 0;
     let heartbeatTimer = null;
+
+    writeRequestLog(
+      requestLogStream,
+      `# requestId=${requestId} startedAt=${new Date(startedAt).toISOString()} repoPath=${JSON.stringify(repoPath)} branch=${JSON.stringify(branch)} subdir=${JSON.stringify(subdir)} args=${JSON.stringify(args)} remoteAddress=${JSON.stringify(remoteAddress)}\n`
+    );
+
+    log("INFO", "build_request_started", {
+      requestId,
+      repoPath,
+      branch,
+      subdir,
+      args,
+      buildLogPath,
+    });
+
+    const emitResponseLine = (line, logMessage, meta = {}, level = "INFO", includeInRequestLog = true) => {
+      const text = `${line}\n`;
+      res.write(text);
+      if (includeInRequestLog) {
+        writeRequestLog(requestLogStream, text);
+      }
+      if (logMessage) {
+        log(level, logMessage, { requestId, ...meta, line });
+      }
+    };
 
     const streamLine = (line) => {
       const trimmed = line.trim();
       if (!trimmed || streamed.has(trimmed)) return;
       streamed.add(trimmed);
-      res.write(trimmed + "\n");
+      emitResponseLine(trimmed, "build_output", {}, "INFO", false);
     };
 
     const stdoutStreamer = createLineStreamer(streamLine);
@@ -262,30 +390,50 @@ const server = http.createServer((req, res) => {
       stderrStreamer.flush();
 
       if (statusLine && !streamed.has(statusLine)) {
-        res.write(`${statusLine}\n`);
+        emitResponseLine(statusLine, "build_status");
       }
 
       if (worktreePath) {
+        log("INFO", "worktree_cleanup_started", { requestId, repoPath, worktreePath });
         await removeWorktree(repoPath, worktreePath);
+        log("INFO", "worktree_cleanup_finished", { requestId, repoPath, worktreePath });
       }
 
+      const finalSummary = {
+        ...summary,
+        requestId,
+        buildLogPath,
+        buildCwd,
+        durationMs: Date.now() - startedAt,
+        cleanedUp: true
+      };
+
+      const resultText = JSON.stringify(finalSummary) + "\n";
       res.write("\n__RESULT__\n");
-      res.write(
-        JSON.stringify({
-          ...summary,
-          buildCwd,
-          durationMs: Date.now() - startedAt,
-          cleanedUp: true
-        }) + "\n"
-      );
+      writeRequestLog(requestLogStream, "\n__RESULT__\n");
+      res.write(resultText);
+      writeRequestLog(requestLogStream, resultText);
       res.end();
+
+      log(finalSummary.ok ? "INFO" : "ERROR", "build_request_finished", {
+        requestId,
+        repoPath,
+        branch,
+        ok: finalSummary.ok,
+        exitCode: finalSummary.exitCode,
+        signal: finalSummary.signal,
+        durationMs: finalSummary.durationMs,
+        buildLogPath,
+      });
+
+      closeRequestLog(requestLogStream);
     };
 
     try {
       const tmpBase = await fs.mkdtemp(path.join(os.tmpdir(), "xcodebuild-worktree-"));
       worktreePath = path.join(tmpBase, "repo");
 
-      res.write(`PREPARING_WORKTREE:${branch}\n`);
+      emitResponseLine(`PREPARING_WORKTREE:${branch}`, "preparing_worktree", { branch });
 
       await run("git", ["fetch", "--all", "--prune"], {
         cwd: repoPath,
@@ -303,8 +451,8 @@ const server = http.createServer((req, res) => {
         throw new Error("`subdir` must stay inside the checked-out worktree");
       }
 
-      res.write(`WORKTREE_PATH:${worktreePath}\n`);
-      res.write(`BUILD_CWD:${buildCwd}\n`);
+      emitResponseLine(`WORKTREE_PATH:${worktreePath}`, "worktree_created", { worktreePath });
+      emitResponseLine(`BUILD_CWD:${buildCwd}`, "build_cwd_ready", { buildCwd });
 
       const child = spawn("xcodebuild", args, {
         cwd: buildCwd,
@@ -314,9 +462,9 @@ const server = http.createServer((req, res) => {
         },
       });
 
-      res.write("BUILD_STARTED\n");
+      emitResponseLine("BUILD_STARTED", "build_spawned", { buildCwd, args });
       if (child.pid) {
-        res.write(`XCODEBUILD_PID:${child.pid}\n`);
+        emitResponseLine(`XCODEBUILD_PID:${child.pid}`, "xcodebuild_pid", { pid: child.pid });
       }
 
       heartbeatTimer = setInterval(() => {
@@ -329,13 +477,16 @@ const server = http.createServer((req, res) => {
           return;
         }
         lastHeartbeatAt = now;
-        res.write(`BUILD_HEARTBEAT:elapsedMs=${now - startedAt}\n`);
+        emitResponseLine(`BUILD_HEARTBEAT:elapsedMs=${now - startedAt}`, "build_heartbeat", {
+          elapsedMs: now - startedAt,
+        });
       }, HEARTBEAT_TICK_MS);
 
       child.stdout.on("data", (chunk) => {
         const text = chunk.toString("utf8");
         combined += text;
         lastProcessOutputAt = Date.now();
+        writeRequestLog(requestLogStream, text);
         stdoutStreamer.push(text);
       });
 
@@ -343,10 +494,12 @@ const server = http.createServer((req, res) => {
         const text = chunk.toString("utf8");
         combined += text;
         lastProcessOutputAt = Date.now();
+        writeRequestLog(requestLogStream, text);
         stderrStreamer.push(text);
       });
 
       child.on("error", async (err) => {
+        log("ERROR", "xcodebuild_spawn_failed", { requestId, error: err.message, buildCwd, args });
         await finalize({
           ok: false,
           exitCode: null,
@@ -381,6 +534,12 @@ const server = http.createServer((req, res) => {
         }, ok ? "BUILD SUCCEEDED" : "BUILD FAILED");
       });
     } catch (err) {
+      log("ERROR", "build_request_failed_before_spawn", {
+        requestId,
+        repoPath,
+        branch,
+        error: err.message,
+      });
       await finalize({
         ok: false,
         exitCode: null,
@@ -399,7 +558,25 @@ const server = http.createServer((req, res) => {
 
 server.requestTimeout = 0;
 server.timeout = 0;
+server.on("error", (err) => {
+  log("ERROR", "server_error", {
+    port: PORT,
+    code: err.code,
+    syscall: err.syscall,
+    address: err.address,
+    error: err.message,
+  });
+  if (!server.listening) {
+    serverLogStream.end(() => {
+      process.exit(1);
+    });
+  }
+});
 
 server.listen(PORT, () => {
-  console.log(`xcodebuild-runner listening on ${PORT}`);
+  log("INFO", "server_listening", {
+    port: PORT,
+    logDir: LOG_DIR,
+    serverLogPath: SERVER_LOG_PATH,
+  });
 });
