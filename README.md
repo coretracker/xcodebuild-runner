@@ -7,10 +7,11 @@ This is useful when the agent itself runs in Linux or Docker, but the actual iOS
 ## What it does
 
 - Accepts a `POST /xcodebuild` request.
-- Runs `git fetch --all --prune` in the target repository.
-- Creates a temporary git worktree for the requested branch.
-- Runs `xcodebuild` in that worktree.
+- If `branch` is provided, runs `git fetch --all --prune` in the target repository.
+- If `branch` is provided, creates a temporary git worktree for that branch.
+- Runs `xcodebuild` either in that worktree or directly in `repoPath` when `branch` is omitted.
 - Streams important lines back to the client:
+  - `BUILD_MODE:worktree` or `BUILD_MODE:direct`
   - `PREPARING_WORKTREE:...`
   - `FETCHING_REFS`
   - `CREATING_WORKTREE:...`
@@ -32,8 +33,9 @@ This is useful when the agent itself runs in Linux or Docker, but the actual iOS
 - macOS host
 - Xcode and `xcodebuild` installed
 - git installed
-- the target repository already cloned on disk
-- the requested branch available locally or fetchable from the repo remote
+- the target directory available on disk
+- for worktree mode only: the target repository already cloned on disk
+- for worktree mode only: the requested branch available locally or fetchable from the repo remote
 - default port `48173` unless overridden with `PORT`
 - logs are written to `./logs` by default unless overridden with `LOG_DIR`
 - heartbeats default to `HEARTBEAT_IDLE_MS=10000` and `HEARTBEAT_TICK_MS=2000`
@@ -64,8 +66,8 @@ Body:
 
 Fields:
 
-- `repoPath`: absolute path to the git repository on the macOS host
-- `branch`: branch to check out in a temporary worktree
+- `repoPath`: absolute path to the build directory on the macOS host
+- `branch`: optional branch to check out in a temporary worktree; omit it to build `repoPath` directly without git
 - `subdir`: optional relative subdirectory inside the repo where `xcodebuild` should run
 - `args`: raw `xcodebuild` arguments as an array of strings
 
@@ -81,6 +83,7 @@ __RESULT__
 Useful summary fields:
 
 - `ok`
+- `buildMode`
 - `exitCode`
 - `signal`
 - `errors`
@@ -92,6 +95,7 @@ For failures, the JSON contains extracted error lines and falls back to a useful
 
 Useful streamed markers before `__RESULT__`:
 
+- `BUILD_MODE:worktree` or `BUILD_MODE:direct`
 - `PREPARING_WORKTREE:<branch>`
 - `FETCHING_REFS`
 - `CREATING_WORKTREE:<branch>`
@@ -167,6 +171,24 @@ curl -N http://localhost:48173/xcodebuild \
   }'
 ```
 
+Direct build without git or worktrees:
+
+```bash
+curl -N http://localhost:48173/xcodebuild \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repoPath": "/absolute/path/to/project",
+    "subdir": "",
+    "args": [
+      "-workspace", "MyApp.xcworkspace",
+      "-scheme", "MyApp",
+      "-destination", "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.0",
+      "build"
+    ]
+  }'
+```
+
 ## Agent Prompt
 
 Use this as a copy-paste prompt when sharing the tool with other agents:
@@ -184,7 +206,8 @@ Request JSON:
 - args: array of raw xcodebuild arguments
 
 Behavior:
-- The service fetches remotes, creates a temporary git worktree for the branch, runs xcodebuild there, streams notable build lines, and removes the worktree afterward.
+- If `branch` is provided, the service fetches remotes, creates a temporary git worktree for the branch, runs xcodebuild there, and removes the worktree afterward.
+- If `branch` is omitted, the service runs xcodebuild directly in `repoPath` or `repoPath/subdir` without touching git.
 - It emits `BUILD_STARTED` when the `xcodebuild` process has been spawned successfully.
 - It emits `BUILD_HEARTBEAT` whenever the client has not received any streamed output for too long, including during git fetch/worktree setup and during compile phases that only print non-essential lines.
 - The response is plain text and ends with:
@@ -193,7 +216,7 @@ Behavior:
 - The final JSON is the source of truth for success or failure.
 
 How you should use it:
-1. Choose the exact branch to validate.
+1. If you want a clean branch build, provide `branch`; if you want to build an existing directory as-is, omit `branch`.
 2. Pass xcodebuild arguments explicitly, including project/workspace, scheme, destination, and action.
 3. Wait for the final __RESULT__ JSON.
 4. Treat ok=false, BUILD FAILED, non-zero exitCode, a non-null signal, or extracted errors as a failed build.

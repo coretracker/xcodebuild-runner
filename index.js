@@ -74,10 +74,10 @@ function sanitizeForFilename(value) {
     .slice(0, 80) || "build";
 }
 
-function createBuildLogStream(requestId, branch, startedAt) {
-  const safeBranch = sanitizeForFilename(branch);
+function createBuildLogStream(requestId, label, startedAt) {
+  const safeLabel = sanitizeForFilename(label);
   const safeTimestamp = new Date(startedAt).toISOString().replace(/[:.]/g, "-");
-  const logPath = path.join(LOG_DIR, `build-${safeTimestamp}-${safeBranch}-${requestId}.log`);
+  const logPath = path.join(LOG_DIR, `build-${safeTimestamp}-${safeLabel}-${requestId}.log`);
   const stream = createWriteStream(logPath, { flags: "a" });
   stream.on("error", (err) => {
     log("ERROR", "build_log_stream_failed", { requestId, buildLogPath: logPath, error: err.message });
@@ -242,6 +242,15 @@ async function removeWorktree(repoPath, worktreePath) {
   } catch {}
 }
 
+function resolveBuildCwd(basePath, subdir) {
+  const resolvedBasePath = path.resolve(basePath);
+  const buildCwd = subdir ? path.resolve(resolvedBasePath, subdir) : resolvedBasePath;
+  if (buildCwd !== resolvedBasePath && !buildCwd.startsWith(`${resolvedBasePath}${path.sep}`)) {
+    throw new Error("`subdir` must stay inside the target directory");
+  }
+  return { resolvedBasePath, buildCwd };
+}
+
 const server = http.createServer((req, res) => {
   const requestId = buildRequestId();
   const remoteAddress = req.socket.remoteAddress ?? null;
@@ -284,10 +293,13 @@ const server = http.createServer((req, res) => {
 
     const {
       repoPath,
-      branch,
+      branch: rawBranch,
       args = [],
       subdir = "",
     } = payload;
+    const normalizedBranch = typeof rawBranch === "string" ? rawBranch.trim() : "";
+    const branch = normalizedBranch || null;
+    const buildMode = branch ? "worktree" : "direct";
 
     if (!repoPath || typeof repoPath !== "string") {
       log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`repoPath` is required" });
@@ -303,10 +315,10 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    if (!branch || typeof branch !== "string") {
-      log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`branch` is required" });
+    if (rawBranch != null && typeof rawBranch !== "string") {
+      log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`branch` must be a string when provided" });
       res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "`branch` is required" }));
+      res.end(JSON.stringify({ ok: false, error: "`branch` must be a string when provided" }));
       return;
     }
 
@@ -332,7 +344,7 @@ const server = http.createServer((req, res) => {
     }
 
     const startedAt = Date.now();
-    const { logPath: buildLogPath, stream: requestLogStream } = createBuildLogStream(requestId, branch, startedAt);
+    const { logPath: buildLogPath, stream: requestLogStream } = createBuildLogStream(requestId, branch ?? buildMode, startedAt);
 
     res.writeHead(200, {
       "Content-Type": "text/plain; charset=utf-8",
@@ -346,20 +358,21 @@ const server = http.createServer((req, res) => {
     let buildCwd = "";
     const streamed = new Set();
     let finished = false;
-    let currentPhase = "preparing_worktree";
+    let currentPhase = branch ? "preparing_worktree" : "preparing_build";
     let lastClientOutputAt = startedAt;
     let lastHeartbeatAt = 0;
     let heartbeatTimer = null;
 
     writeRequestLog(
       requestLogStream,
-      `# requestId=${requestId} startedAt=${new Date(startedAt).toISOString()} repoPath=${JSON.stringify(repoPath)} branch=${JSON.stringify(branch)} subdir=${JSON.stringify(subdir)} args=${JSON.stringify(args)} remoteAddress=${JSON.stringify(remoteAddress)}\n`
+      `# requestId=${requestId} startedAt=${new Date(startedAt).toISOString()} repoPath=${JSON.stringify(repoPath)} branch=${JSON.stringify(branch)} buildMode=${JSON.stringify(buildMode)} subdir=${JSON.stringify(subdir)} args=${JSON.stringify(args)} remoteAddress=${JSON.stringify(remoteAddress)}\n`
     );
 
     log("INFO", "build_request_started", {
       requestId,
       repoPath,
       branch,
+      buildMode,
       subdir,
       args,
       buildLogPath,
@@ -437,8 +450,9 @@ const server = http.createServer((req, res) => {
         requestId,
         buildLogPath,
         buildCwd,
+        buildMode,
         durationMs: Date.now() - startedAt,
-        cleanedUp: true
+        cleanedUp: worktreePath ? true : false
       };
 
       const resultText = JSON.stringify(finalSummary) + "\n";
@@ -463,33 +477,40 @@ const server = http.createServer((req, res) => {
     };
 
     try {
-      const tmpBase = await fs.mkdtemp(path.join(os.tmpdir(), "xcodebuild-worktree-"));
-      worktreePath = path.join(tmpBase, "repo");
+      emitResponseLine(`BUILD_MODE:${buildMode}`, "build_mode", { buildMode });
 
-      emitResponseLine(`PREPARING_WORKTREE:${branch}`, "preparing_worktree", { branch });
-      currentPhase = "fetching_refs";
-      emitResponseLine("FETCHING_REFS", "fetching_refs");
+      if (branch) {
+        const tmpBase = await fs.mkdtemp(path.join(os.tmpdir(), "xcodebuild-worktree-"));
+        worktreePath = path.join(tmpBase, "repo");
 
-      await run("git", ["fetch", "--all", "--prune"], {
-        cwd: repoPath,
-        env: process.env,
-      });
+        emitResponseLine(`PREPARING_WORKTREE:${branch}`, "preparing_worktree", { branch });
+        currentPhase = "fetching_refs";
+        emitResponseLine("FETCHING_REFS", "fetching_refs");
 
-      currentPhase = "creating_worktree";
-      emitResponseLine(`CREATING_WORKTREE:${branch}`, "creating_worktree", { branch });
+        await run("git", ["fetch", "--all", "--prune"], {
+          cwd: repoPath,
+          env: process.env,
+        });
 
-      await run("git", ["worktree", "add", "--force", worktreePath, branch], {
-        cwd: repoPath,
-        env: process.env,
-      });
+        currentPhase = "creating_worktree";
+        emitResponseLine(`CREATING_WORKTREE:${branch}`, "creating_worktree", { branch });
 
-      buildCwd = subdir ? path.resolve(worktreePath, subdir) : worktreePath;
-      const resolvedWorktreePath = path.resolve(worktreePath);
-      if (buildCwd !== resolvedWorktreePath && !buildCwd.startsWith(`${resolvedWorktreePath}${path.sep}`)) {
-        throw new Error("`subdir` must stay inside the checked-out worktree");
+        await run("git", ["worktree", "add", "--force", worktreePath, branch], {
+          cwd: repoPath,
+          env: process.env,
+        });
+
+        buildCwd = resolveBuildCwd(worktreePath, subdir).buildCwd;
+        emitResponseLine(`WORKTREE_PATH:${worktreePath}`, "worktree_created", { worktreePath });
+      } else {
+        currentPhase = "resolving_build_cwd";
+        const resolved = resolveBuildCwd(repoPath, subdir);
+        buildCwd = resolved.buildCwd;
+        if (!(await pathExists(buildCwd))) {
+          throw new Error("Resolved build directory does not exist");
+        }
       }
 
-      emitResponseLine(`WORKTREE_PATH:${worktreePath}`, "worktree_created", { worktreePath });
       emitResponseLine(`BUILD_CWD:${buildCwd}`, "build_cwd_ready", { buildCwd });
 
       const child = spawn("xcodebuild", args, {
