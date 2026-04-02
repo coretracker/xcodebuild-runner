@@ -7,15 +7,8 @@ This is useful when the agent itself runs in Linux or Docker, but the actual iOS
 ## What it does
 
 - Accepts a `POST /xcodebuild` request.
-- If `branch` is provided, runs `git fetch --all --prune` in the target repository.
-- If `branch` is provided, creates a temporary git worktree for that branch.
-- Runs `xcodebuild` either in that worktree or directly in `repoPath` when `branch` is omitted.
+- Runs `xcodebuild` directly in `repoPath` or `repoPath/subdir`.
 - Streams important lines back to the client:
-  - `BUILD_MODE:worktree` or `BUILD_MODE:direct`
-  - `PREPARING_WORKTREE:...`
-  - `FETCHING_REFS`
-  - `CREATING_WORKTREE:...`
-  - `WORKTREE_PATH:...`
   - `BUILD_CWD:...`
   - `BUILD_STARTED`
   - `XCODEBUILD_PID:...`
@@ -23,19 +16,15 @@ This is useful when the agent itself runs in Linux or Docker, but the actual iOS
   - compiler / build errors
   - `BUILD SUCCEEDED` or `BUILD FAILED`
 - Ends with a machine-readable JSON block after `__RESULT__`.
-- Removes the temporary worktree on completion.
 - Keeps the HTTP request open for long-running builds instead of timing out.
-- Sends keepalive heartbeats during worktree setup too, not only after `xcodebuild` starts.
 - Returns a final failure summary even when `xcodebuild` fails without clean compiler-style `error:` lines.
+- Rejects the old `branch` field; pass the directory you want to build in `repoPath`.
 
 ## Requirements
 
 - macOS host
 - Xcode and `xcodebuild` installed
-- git installed
 - the target directory available on disk
-- for worktree mode only: the target repository already cloned on disk
-- for worktree mode only: the requested branch available locally or fetchable from the repo remote
 - default port `48173` unless overridden with `PORT`
 - logs are written to `./logs` by default unless overridden with `LOG_DIR`
 - heartbeats default to `HEARTBEAT_IDLE_MS=10000` and `HEARTBEAT_TICK_MS=2000`
@@ -52,8 +41,7 @@ Body:
 
 ```json
 {
-  "repoPath": "/absolute/path/to/repo",
-  "branch": "feature/some-branch",
+  "repoPath": "/absolute/path/to/project",
   "subdir": "",
   "args": [
     "-scheme", "MyApp",
@@ -67,9 +55,10 @@ Body:
 Fields:
 
 - `repoPath`: absolute path to the build directory on the macOS host
-- `branch`: optional branch to check out in a temporary worktree; omit it to build `repoPath` directly without git
 - `subdir`: optional relative subdirectory inside the repo where `xcodebuild` should run
 - `args`: raw `xcodebuild` arguments as an array of strings
+
+The `branch` field is no longer supported.
 
 ### Response
 
@@ -83,7 +72,6 @@ __RESULT__
 Useful summary fields:
 
 - `ok`
-- `buildMode`
 - `exitCode`
 - `signal`
 - `errors`
@@ -95,11 +83,6 @@ For failures, the JSON contains extracted error lines and falls back to a useful
 
 Useful streamed markers before `__RESULT__`:
 
-- `BUILD_MODE:worktree` or `BUILD_MODE:direct`
-- `PREPARING_WORKTREE:<branch>`
-- `FETCHING_REFS`
-- `CREATING_WORKTREE:<branch>`
-- `WORKTREE_PATH:<path>`
 - `BUILD_CWD:<path>`
 - `BUILD_STARTED`
 - `XCODEBUILD_PID:<pid>`
@@ -109,10 +92,10 @@ Useful streamed markers before `__RESULT__`:
 
 The runner now logs locally in two places:
 
-- Terminal/stdout: request lifecycle, worktree setup, build start, heartbeats, important build errors, and final status.
+- Terminal/stdout: request lifecycle, build start, heartbeats, important build errors, and final status.
 - Files under `logs/` by default:
   - `logs/xcodebuild-runner.log`: server-level log stream
-  - `logs/build-<timestamp>-<branch>-<requestId>.log`: full output for a single build, including raw `xcodebuild` output
+  - `logs/build-<timestamp>-<directory>-<requestId>.log`: full output for a single build, including raw `xcodebuild` output
 
 You can override the directory with `LOG_DIR=/absolute/path/to/logs`.
 
@@ -141,7 +124,6 @@ curl -N http://host.docker.internal:48173/xcodebuild \
   -H "Content-Type: application/json" \
   -d '{
     "repoPath": "/Users/you/Repositories/MyApp-iOS",
-    "branch": "feature/my-change",
     "subdir": "",
     "args": [
       "-scheme", "MyApp",
@@ -160,29 +142,10 @@ curl -N http://localhost:48173/xcodebuild \
   -H "Content-Type: application/json" \
   -d '{
     "repoPath": "/Users/you/Repositories/MyApp-iOS",
-    "branch": "feature/my-change",
     "subdir": "",
     "args": [
       "-scheme", "MyApp",
       "-workspace", "MyApp.xcworkspace",
-      "-destination", "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.0",
-      "build"
-    ]
-  }'
-```
-
-Direct build without git or worktrees:
-
-```bash
-curl -N http://localhost:48173/xcodebuild \
-  -X POST \
-  -H "Content-Type: application/json" \
-  -d '{
-    "repoPath": "/absolute/path/to/project",
-    "subdir": "",
-    "args": [
-      "-workspace", "MyApp.xcworkspace",
-      "-scheme", "MyApp",
       "-destination", "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.0",
       "build"
     ]
@@ -200,23 +163,21 @@ Endpoint:
 - POST http://host.docker.internal:48173/xcodebuild
 
 Request JSON:
-- repoPath: absolute macOS path to the repository
-- branch: branch to build
+- repoPath: absolute macOS path to the build directory
 - subdir: optional relative subdirectory inside the repo
 - args: array of raw xcodebuild arguments
 
 Behavior:
-- If `branch` is provided, the service fetches remotes, creates a temporary git worktree for the branch, runs xcodebuild there, and removes the worktree afterward.
-- If `branch` is omitted, the service runs xcodebuild directly in `repoPath` or `repoPath/subdir` without touching git.
+- The service runs xcodebuild directly in `repoPath` or `repoPath/subdir`.
 - It emits `BUILD_STARTED` when the `xcodebuild` process has been spawned successfully.
-- It emits `BUILD_HEARTBEAT` whenever the client has not received any streamed output for too long, including during git fetch/worktree setup and during compile phases that only print non-essential lines.
+- It emits `BUILD_HEARTBEAT` whenever the client has not received any streamed output for too long.
 - The response is plain text and ends with:
   __RESULT__
   { ...json summary... }
 - The final JSON is the source of truth for success or failure.
 
 How you should use it:
-1. If you want a clean branch build, provide `branch`; if you want to build an existing directory as-is, omit `branch`.
+1. Pass the exact directory to build in `repoPath`.
 2. Pass xcodebuild arguments explicitly, including project/workspace, scheme, destination, and action.
 3. Wait for the final __RESULT__ JSON.
 4. Treat ok=false, BUILD FAILED, non-zero exitCode, a non-null signal, or extracted errors as a failed build.

@@ -3,7 +3,6 @@ import { randomUUID } from "crypto";
 import { spawn } from "child_process";
 import { createWriteStream, mkdirSync } from "fs";
 import fs from "fs/promises";
-import os from "os";
 import path from "path";
 
 const DEFAULT_PORT = 48173;
@@ -103,35 +102,6 @@ function buildRequestId() {
   return `${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
 }
 
-function run(cmd, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, options);
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout?.on("data", (d) => {
-      stdout += d.toString("utf8");
-    });
-
-    child.stderr?.on("data", (d) => {
-      stderr += d.toString("utf8");
-    });
-
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) {
-        resolve({ stdout, stderr, code });
-      } else {
-        const err = new Error(`${cmd} exited with code ${code}`);
-        err.code = code;
-        err.stdout = stdout;
-        err.stderr = stderr;
-        reject(err);
-      }
-    });
-  });
-}
-
 function isImportantOutputLine(trimmed) {
   if (!trimmed) return false;
 
@@ -227,21 +197,6 @@ async function pathExists(p) {
   }
 }
 
-async function removeWorktree(repoPath, worktreePath) {
-  try {
-    await run("git", ["worktree", "remove", "--force", worktreePath], {
-      cwd: repoPath,
-      env: process.env,
-    });
-  } catch {}
-
-  try {
-    if (await pathExists(worktreePath)) {
-      await fs.rm(worktreePath, { recursive: true, force: true });
-    }
-  } catch {}
-}
-
 function resolveBuildCwd(basePath, subdir) {
   const resolvedBasePath = path.resolve(basePath);
   const buildCwd = subdir ? path.resolve(resolvedBasePath, subdir) : resolvedBasePath;
@@ -293,13 +248,9 @@ const server = http.createServer((req, res) => {
 
     const {
       repoPath,
-      branch: rawBranch,
       args = [],
       subdir = "",
     } = payload;
-    const normalizedBranch = typeof rawBranch === "string" ? rawBranch.trim() : "";
-    const branch = normalizedBranch || null;
-    const buildMode = branch ? "worktree" : "direct";
 
     if (!repoPath || typeof repoPath !== "string") {
       log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`repoPath` is required" });
@@ -315,10 +266,10 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    if (rawBranch != null && typeof rawBranch !== "string") {
-      log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`branch` must be a string when provided" });
+    if (Object.prototype.hasOwnProperty.call(payload, "branch")) {
+      log("WARN", "request_rejected", { requestId, remoteAddress, reason: "`branch` is no longer supported" });
       res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "`branch` must be a string when provided" }));
+      res.end(JSON.stringify({ ok: false, error: "`branch` is no longer supported; pass the build directory in `repoPath` instead" }));
       return;
     }
 
@@ -344,7 +295,7 @@ const server = http.createServer((req, res) => {
     }
 
     const startedAt = Date.now();
-    const { logPath: buildLogPath, stream: requestLogStream } = createBuildLogStream(requestId, branch ?? buildMode, startedAt);
+    const { logPath: buildLogPath, stream: requestLogStream } = createBuildLogStream(requestId, path.basename(repoPath) || "build", startedAt);
 
     res.writeHead(200, {
       "Content-Type": "text/plain; charset=utf-8",
@@ -354,25 +305,22 @@ const server = http.createServer((req, res) => {
     res.flushHeaders?.();
 
     let combined = "";
-    let worktreePath = "";
     let buildCwd = "";
     const streamed = new Set();
     let finished = false;
-    let currentPhase = branch ? "preparing_worktree" : "preparing_build";
+    let currentPhase = "resolving_build_cwd";
     let lastClientOutputAt = startedAt;
     let lastHeartbeatAt = 0;
     let heartbeatTimer = null;
 
     writeRequestLog(
       requestLogStream,
-      `# requestId=${requestId} startedAt=${new Date(startedAt).toISOString()} repoPath=${JSON.stringify(repoPath)} branch=${JSON.stringify(branch)} buildMode=${JSON.stringify(buildMode)} subdir=${JSON.stringify(subdir)} args=${JSON.stringify(args)} remoteAddress=${JSON.stringify(remoteAddress)}\n`
+      `# requestId=${requestId} startedAt=${new Date(startedAt).toISOString()} repoPath=${JSON.stringify(repoPath)} subdir=${JSON.stringify(subdir)} args=${JSON.stringify(args)} remoteAddress=${JSON.stringify(remoteAddress)}\n`
     );
 
     log("INFO", "build_request_started", {
       requestId,
       repoPath,
-      branch,
-      buildMode,
       subdir,
       args,
       buildLogPath,
@@ -438,21 +386,13 @@ const server = http.createServer((req, res) => {
         emitResponseLine(statusLine, "build_status");
       }
 
-      if (worktreePath) {
-        currentPhase = "cleaning_up";
-        log("INFO", "worktree_cleanup_started", { requestId, repoPath, worktreePath });
-        await removeWorktree(repoPath, worktreePath);
-        log("INFO", "worktree_cleanup_finished", { requestId, repoPath, worktreePath });
-      }
-
       const finalSummary = {
         ...summary,
         requestId,
         buildLogPath,
         buildCwd,
-        buildMode,
         durationMs: Date.now() - startedAt,
-        cleanedUp: worktreePath ? true : false
+        cleanedUp: false
       };
 
       const resultText = JSON.stringify(finalSummary) + "\n";
@@ -465,7 +405,6 @@ const server = http.createServer((req, res) => {
       log(finalSummary.ok ? "INFO" : "ERROR", "build_request_finished", {
         requestId,
         repoPath,
-        branch,
         ok: finalSummary.ok,
         exitCode: finalSummary.exitCode,
         signal: finalSummary.signal,
@@ -477,38 +416,10 @@ const server = http.createServer((req, res) => {
     };
 
     try {
-      emitResponseLine(`BUILD_MODE:${buildMode}`, "build_mode", { buildMode });
-
-      if (branch) {
-        const tmpBase = await fs.mkdtemp(path.join(os.tmpdir(), "xcodebuild-worktree-"));
-        worktreePath = path.join(tmpBase, "repo");
-
-        emitResponseLine(`PREPARING_WORKTREE:${branch}`, "preparing_worktree", { branch });
-        currentPhase = "fetching_refs";
-        emitResponseLine("FETCHING_REFS", "fetching_refs");
-
-        await run("git", ["fetch", "--all", "--prune"], {
-          cwd: repoPath,
-          env: process.env,
-        });
-
-        currentPhase = "creating_worktree";
-        emitResponseLine(`CREATING_WORKTREE:${branch}`, "creating_worktree", { branch });
-
-        await run("git", ["worktree", "add", "--force", worktreePath, branch], {
-          cwd: repoPath,
-          env: process.env,
-        });
-
-        buildCwd = resolveBuildCwd(worktreePath, subdir).buildCwd;
-        emitResponseLine(`WORKTREE_PATH:${worktreePath}`, "worktree_created", { worktreePath });
-      } else {
-        currentPhase = "resolving_build_cwd";
-        const resolved = resolveBuildCwd(repoPath, subdir);
-        buildCwd = resolved.buildCwd;
-        if (!(await pathExists(buildCwd))) {
-          throw new Error("Resolved build directory does not exist");
-        }
+      const resolved = resolveBuildCwd(repoPath, subdir);
+      buildCwd = resolved.buildCwd;
+      if (!(await pathExists(buildCwd))) {
+        throw new Error("Resolved build directory does not exist");
       }
 
       emitResponseLine(`BUILD_CWD:${buildCwd}`, "build_cwd_ready", { buildCwd });
@@ -548,8 +459,6 @@ const server = http.createServer((req, res) => {
           exitCode: null,
           signal: null,
           repoPath,
-          branch,
-          worktreePath,
           args,
           errors: [`Failed to start xcodebuild: ${err.message}`],
           logTail: tailLines(combined, 40),
@@ -571,8 +480,6 @@ const server = http.createServer((req, res) => {
           exitCode: code,
           signal: signal ?? null,
           repoPath,
-          branch,
-          worktreePath,
           args,
           errors,
           logTail: ok ? [] : tailLines(combined, 80),
@@ -582,7 +489,6 @@ const server = http.createServer((req, res) => {
       log("ERROR", "build_request_failed_before_spawn", {
         requestId,
         repoPath,
-        branch,
         error: err.message,
       });
       await finalize({
@@ -590,12 +496,8 @@ const server = http.createServer((req, res) => {
         exitCode: null,
         signal: null,
         repoPath,
-        branch,
-        worktreePath,
         args,
         errors: [err.message],
-        gitStdout: err.stdout || "",
-        gitStderr: err.stderr || "",
       }, "BUILD FAILED");
     }
   });
