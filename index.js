@@ -8,12 +8,14 @@ import path from "path";
 
 const DEFAULT_PORT = 48173;
 const DEFAULT_LOG_DIR = path.resolve(process.cwd(), "logs");
+const DEFAULT_HEARTBEAT_IDLE_MS = 10_000;
+const DEFAULT_HEARTBEAT_TICK_MS = 2_000;
 const parsedPort = Number.parseInt(process.env.PORT ?? "", 10);
 const PORT = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : DEFAULT_PORT;
 const LOG_DIR = process.env.LOG_DIR ? path.resolve(process.env.LOG_DIR) : DEFAULT_LOG_DIR;
 const SERVER_LOG_PATH = path.join(LOG_DIR, "xcodebuild-runner.log");
-const HEARTBEAT_IDLE_MS = 30_000;
-const HEARTBEAT_TICK_MS = 5_000;
+const HEARTBEAT_IDLE_MS = parsePositiveIntegerEnv(process.env.HEARTBEAT_IDLE_MS, DEFAULT_HEARTBEAT_IDLE_MS);
+const HEARTBEAT_TICK_MS = parsePositiveIntegerEnv(process.env.HEARTBEAT_TICK_MS, DEFAULT_HEARTBEAT_TICK_MS);
 const IMPORTANT_FAILURE_MARKERS = [
   "BUILD FAILED",
   "TEST FAILED",
@@ -35,6 +37,11 @@ function serializeMetaValue(value) {
   if (value instanceof Error) return JSON.stringify(value.message);
   if (typeof value === "string") return JSON.stringify(value);
   return JSON.stringify(value);
+}
+
+function parsePositiveIntegerEnv(value, fallback) {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function formatMeta(meta = {}) {
@@ -332,13 +339,15 @@ const server = http.createServer((req, res) => {
       "Transfer-Encoding": "chunked",
       "Cache-Control": "no-cache",
     });
+    res.flushHeaders?.();
 
     let combined = "";
     let worktreePath = "";
     let buildCwd = "";
     const streamed = new Set();
     let finished = false;
-    let lastProcessOutputAt = startedAt;
+    let currentPhase = "preparing_worktree";
+    let lastClientOutputAt = startedAt;
     let lastHeartbeatAt = 0;
     let heartbeatTimer = null;
 
@@ -359,6 +368,7 @@ const server = http.createServer((req, res) => {
     const emitResponseLine = (line, logMessage, meta = {}, level = "INFO", includeInRequestLog = true) => {
       const text = `${line}\n`;
       res.write(text);
+      lastClientOutputAt = Date.now();
       if (includeInRequestLog) {
         writeRequestLog(requestLogStream, text);
       }
@@ -377,6 +387,28 @@ const server = http.createServer((req, res) => {
     const stdoutStreamer = createLineStreamer(streamLine);
     const stderrStreamer = createLineStreamer(streamLine);
 
+    heartbeatTimer = setInterval(() => {
+      if (finished) return;
+      const now = Date.now();
+      const idleMs = now - lastClientOutputAt;
+      if (idleMs < HEARTBEAT_IDLE_MS) {
+        return;
+      }
+      if (now - lastHeartbeatAt < HEARTBEAT_IDLE_MS) {
+        return;
+      }
+      lastHeartbeatAt = now;
+      emitResponseLine(
+        `BUILD_HEARTBEAT:elapsedMs=${now - startedAt},idleMs=${idleMs},phase=${currentPhase}`,
+        "build_heartbeat",
+        {
+          elapsedMs: now - startedAt,
+          idleMs,
+          phase: currentPhase,
+        }
+      );
+    }, HEARTBEAT_TICK_MS);
+
     const finalize = async (summary, statusLine) => {
       if (finished) return;
       finished = true;
@@ -394,6 +426,7 @@ const server = http.createServer((req, res) => {
       }
 
       if (worktreePath) {
+        currentPhase = "cleaning_up";
         log("INFO", "worktree_cleanup_started", { requestId, repoPath, worktreePath });
         await removeWorktree(repoPath, worktreePath);
         log("INFO", "worktree_cleanup_finished", { requestId, repoPath, worktreePath });
@@ -434,11 +467,16 @@ const server = http.createServer((req, res) => {
       worktreePath = path.join(tmpBase, "repo");
 
       emitResponseLine(`PREPARING_WORKTREE:${branch}`, "preparing_worktree", { branch });
+      currentPhase = "fetching_refs";
+      emitResponseLine("FETCHING_REFS", "fetching_refs");
 
       await run("git", ["fetch", "--all", "--prune"], {
         cwd: repoPath,
         env: process.env,
       });
+
+      currentPhase = "creating_worktree";
+      emitResponseLine(`CREATING_WORKTREE:${branch}`, "creating_worktree", { branch });
 
       await run("git", ["worktree", "add", "--force", worktreePath, branch], {
         cwd: repoPath,
@@ -462,30 +500,15 @@ const server = http.createServer((req, res) => {
         },
       });
 
+      currentPhase = "running_build";
       emitResponseLine("BUILD_STARTED", "build_spawned", { buildCwd, args });
       if (child.pid) {
         emitResponseLine(`XCODEBUILD_PID:${child.pid}`, "xcodebuild_pid", { pid: child.pid });
       }
 
-      heartbeatTimer = setInterval(() => {
-        if (finished) return;
-        const now = Date.now();
-        if (now - lastProcessOutputAt < HEARTBEAT_IDLE_MS) {
-          return;
-        }
-        if (now - lastHeartbeatAt < HEARTBEAT_IDLE_MS) {
-          return;
-        }
-        lastHeartbeatAt = now;
-        emitResponseLine(`BUILD_HEARTBEAT:elapsedMs=${now - startedAt}`, "build_heartbeat", {
-          elapsedMs: now - startedAt,
-        });
-      }, HEARTBEAT_TICK_MS);
-
       child.stdout.on("data", (chunk) => {
         const text = chunk.toString("utf8");
         combined += text;
-        lastProcessOutputAt = Date.now();
         writeRequestLog(requestLogStream, text);
         stdoutStreamer.push(text);
       });
@@ -493,7 +516,6 @@ const server = http.createServer((req, res) => {
       child.stderr.on("data", (chunk) => {
         const text = chunk.toString("utf8");
         combined += text;
-        lastProcessOutputAt = Date.now();
         writeRequestLog(requestLogStream, text);
         stderrStreamer.push(text);
       });
@@ -517,9 +539,11 @@ const server = http.createServer((req, res) => {
         const extractedErrors = extractErrors(combined);
         const ok = code === 0 && !hasFailureMarkers(combined);
         const errors =
-          !ok && extractedErrors.length === 0
-            ? tailLines(combined, 40)
-            : extractedErrors;
+          ok
+            ? []
+            : extractedErrors.length === 0
+              ? tailLines(combined, 40)
+              : extractedErrors;
 
         await finalize({
           ok,

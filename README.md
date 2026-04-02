@@ -12,16 +12,19 @@ This is useful when the agent itself runs in Linux or Docker, but the actual iOS
 - Runs `xcodebuild` in that worktree.
 - Streams important lines back to the client:
   - `PREPARING_WORKTREE:...`
+  - `FETCHING_REFS`
+  - `CREATING_WORKTREE:...`
   - `WORKTREE_PATH:...`
   - `BUILD_CWD:...`
   - `BUILD_STARTED`
   - `XCODEBUILD_PID:...`
-  - `BUILD_HEARTBEAT:elapsedMs=...` during long silent compile phases
+  - `BUILD_HEARTBEAT:elapsedMs=...,idleMs=...,phase=...` whenever the client has not received any streamed line for too long
   - compiler / build errors
   - `BUILD SUCCEEDED` or `BUILD FAILED`
 - Ends with a machine-readable JSON block after `__RESULT__`.
 - Removes the temporary worktree on completion.
 - Keeps the HTTP request open for long-running builds instead of timing out.
+- Sends keepalive heartbeats during worktree setup too, not only after `xcodebuild` starts.
 - Returns a final failure summary even when `xcodebuild` fails without clean compiler-style `error:` lines.
 
 ## Requirements
@@ -33,6 +36,7 @@ This is useful when the agent itself runs in Linux or Docker, but the actual iOS
 - the requested branch available locally or fetchable from the repo remote
 - default port `48173` unless overridden with `PORT`
 - logs are written to `./logs` by default unless overridden with `LOG_DIR`
+- heartbeats default to `HEARTBEAT_IDLE_MS=10000` and `HEARTBEAT_TICK_MS=2000`
 
 ## API
 
@@ -89,11 +93,13 @@ For failures, the JSON contains extracted error lines and falls back to a useful
 Useful streamed markers before `__RESULT__`:
 
 - `PREPARING_WORKTREE:<branch>`
+- `FETCHING_REFS`
+- `CREATING_WORKTREE:<branch>`
 - `WORKTREE_PATH:<path>`
 - `BUILD_CWD:<path>`
 - `BUILD_STARTED`
 - `XCODEBUILD_PID:<pid>`
-- `BUILD_HEARTBEAT:elapsedMs=<ms>`
+- `BUILD_HEARTBEAT:elapsedMs=<ms>,idleMs=<ms>,phase=<phase>`
 
 ## Logging
 
@@ -180,7 +186,7 @@ Request JSON:
 Behavior:
 - The service fetches remotes, creates a temporary git worktree for the branch, runs xcodebuild there, streams notable build lines, and removes the worktree afterward.
 - It emits `BUILD_STARTED` when the `xcodebuild` process has been spawned successfully.
-- It emits `BUILD_HEARTBEAT` every ~30 seconds during silent compile phases so clients can distinguish “still running” from “hung”.
+- It emits `BUILD_HEARTBEAT` whenever the client has not received any streamed output for too long, including during git fetch/worktree setup and during compile phases that only print non-essential lines.
 - The response is plain text and ends with:
   __RESULT__
   { ...json summary... }
